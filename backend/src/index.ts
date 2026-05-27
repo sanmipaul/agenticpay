@@ -106,6 +106,9 @@ import SandboxManager from './services/sandbox.js';
 import MockPaymentProcessor from './services/mock-payments.js';
 import TestDataSeeder from './services/test-data-seeder.js';
 import { emailV2Router } from './routes/email-v2.js';
+import { createBullMQScheduler, getBullMQScheduler } from './services/bullmq-scheduler.js';
+import { getScheduledTasks } from './config/scheduled-tasks.js';
+import { bullMQMonitorRouter } from './routes/bullmq-monitor.js';
 
 // Validate environment variables at startup
 validateEnv();
@@ -250,6 +253,7 @@ apiV1Router.use('/stellar', stellarRouter);
 apiV1Router.use('/catalog', catalogRouter);
 apiV1Router.use('/jobs', jobsRouter);
 apiV1Router.use('/queue', queueRouter);
+apiV1Router.use('/queue', bullMQMonitorRouter);
 apiV1Router.use('/sla', slaRouter);
 apiV1Router.use('/onboarding', onboardingRouter);
 apiV1Router.use('/legacy', legacyRouter);
@@ -348,6 +352,18 @@ app.use(errorHandler);
 
 if (config.jobs.enabled) {
   startJobs();
+
+  // Start the BullMQ distributed scheduler when Redis is available.
+  // Falls back silently to the in-process node-cron scheduler if Redis is absent.
+  createBullMQScheduler(getScheduledTasks()).then((scheduler) => {
+    if (scheduler) {
+      console.log('[bullmq] Distributed scheduler active');
+    } else {
+      console.log('[scheduler] Using in-process node-cron (Redis not configured)');
+    }
+  }).catch((err) => {
+    console.error('[bullmq] Scheduler startup error:', err);
+  });
 }
 
 registerDefaultProcessors();
@@ -403,6 +419,15 @@ const shutdown = (signal: string) => {
       }
     } catch (err) {
       console.error('Error stopping scheduler:', err);
+    }
+
+    try {
+      const bullScheduler = getBullMQScheduler();
+      if (bullScheduler) {
+        bullScheduler.shutdown().then(() => console.log('BullMQ scheduler stopped.'));
+      }
+    } catch (err) {
+      console.error('Error stopping BullMQ scheduler:', err);
     }
 
     try {
