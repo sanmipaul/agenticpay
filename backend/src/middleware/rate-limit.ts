@@ -89,7 +89,7 @@ export interface RateLimitEvent {
 }
 
 const MAX_ANALYTICS_EVENTS = 5000;
-const analyticsEvents: RateLimitEvent[] = [];
+export const analyticsEvents: RateLimitEvent[] = [];
 
 export function recordAnalyticsEvent(event: RateLimitEvent): void {
   analyticsEvents.push(event);
@@ -283,6 +283,26 @@ function matchEndpointLabel(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Sustained-overuse circuit breaker
+//
+// A client that sustains >80 % block rate over a 5-minute sliding window is
+// considered to be hammering the API.  We escalate from 429 → 503 for that
+// key to signal back-pressure to upstream proxies and circuit breakers.
+// ---------------------------------------------------------------------------
+
+const OVERUSE_WINDOW_MS = 5 * 60 * 1_000;
+const OVERUSE_BLOCK_RATE_THRESHOLD = 0.8;
+const OVERUSE_MIN_REQUESTS = 20;
+
+function isSustainedOveruse(clientKey: string): boolean {
+  const cutoff = Date.now() - OVERUSE_WINDOW_MS;
+  const keyEvents = analyticsEvents.filter((e) => e.key === clientKey && e.ts >= cutoff);
+  if (keyEvents.length < OVERUSE_MIN_REQUESTS) return false;
+  const blocked = keyEvents.filter((e) => !e.allowed).length;
+  return blocked / keyEvents.length >= OVERUSE_BLOCK_RATE_THRESHOLD;
+}
+
+// ---------------------------------------------------------------------------
 // Main middleware factory
 // ---------------------------------------------------------------------------
 
@@ -335,13 +355,23 @@ export function tokenBucketRateLimit(opts: RateLimitOptions = {}) {
 
     if (!result.allowed) {
       res.setHeader('Retry-After', String(Math.ceil(result.retryAfterMs / 1000)));
-      res.status(429).json({
+
+      // Escalate to 503 for clients sustaining a high block rate over 5 minutes
+      const sustained = !sandboxMode && isSustainedOveruse(clientKey);
+      const statusCode = sustained ? 503 : 429;
+      const errorCode = sustained ? 'SUSTAINED_OVERUSE' : 'RATE_LIMIT_EXCEEDED';
+      const message = sustained
+        ? `Service temporarily unavailable: sustained overuse detected for tier '${tier}'. Back off and retry later.`
+        : `Rate limit exceeded for tier '${tier}'. Please retry after ${Math.ceil(result.retryAfterMs / 1000)}s.`;
+
+      res.status(statusCode).json({
         error: {
-          code: 'RATE_LIMIT_EXCEEDED',
-          message: `Rate limit exceeded for tier '${tier}'. Please retry after ${Math.ceil(result.retryAfterMs / 1000)}s.`,
-          status: 429,
+          code: errorCode,
+          message,
+          status: statusCode,
           retryAfterMs: result.retryAfterMs,
           tier,
+          sustained,
           policy: {
             capacity: cfg.capacity,
             refillRate: cfg.refillRate,
