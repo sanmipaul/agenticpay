@@ -24,7 +24,8 @@ Sentry.init({
 });
 import cors from 'cors';
 import { tokenBucketRateLimit } from './middleware/rate-limit.js';
-import compression from 'compression';
+import { compressionMiddleware, getCompressionMetrics } from './middleware/compression.js';
+import { poolMetrics } from './config/database.js';
 import { config } from './config.js';
 import { verificationRouter } from './routes/verification.js';
 import { invoiceRouter } from './routes/invoice.js';
@@ -102,6 +103,7 @@ import { SecurityMiddleware, SecurityMonitor } from './middleware/security.js';
 import { sanitizeInput, contentSecurityPolicy } from './middleware/sanitize.js';
 import { signaturesRouter } from './routes/signatures.js';
 import { createSandboxRouter } from './routes/sandbox.js';
+import { circuitBreakerRouter } from './routes/circuit-breaker.js';
 import SandboxManager from './services/sandbox.js';
 import MockPaymentProcessor from './services/mock-payments.js';
 import TestDataSeeder from './services/test-data-seeder.js';
@@ -186,21 +188,10 @@ app.use(express.json());
 app.use(express.text({ type: ['text/csv', 'text/plain'] }));
 
 app.use(
-  compression({
-    threshold: config.compression.threshold,
-    filter: (req, res) => {
-      if (req.headers['x-no-compression']) {
-        return false;
-      }
-      const contentType = res.getHeader('Content-Type');
-      if (typeof contentType === 'string' && contentType.includes('application/json')) {
-        return true;
-      }
-      if (Array.isArray(contentType) && contentType.some((ct) => ct.includes('application/json'))) {
-        return true;
-      }
-      return compression.filter(req, res);
-    },
+  compressionMiddleware({
+    brotliLevel: 5,
+    gzipLevel: 6,
+    minSizeBytes: 1024,
   })
 );
 
@@ -279,6 +270,14 @@ apiV1Router.use('/push', pushRouter);
 apiV1Router.use('/nfc', nfcRouter);
 // Cache management
 apiV1Router.use('/cache', cacheRouter);
+
+apiV1Router.use('/circuit-breaker', circuitBreakerRouter);
+apiV1Router.get('/compression/metrics', (_req, res) => {
+  res.json(getCompressionMetrics());
+});
+apiV1Router.get('/pool/metrics', (_req, res) => {
+  res.json(poolMetrics.snapshot());
+});
 
 app.use('/api/v1', ipAllowlistMiddleware(), apiV1Router);
 

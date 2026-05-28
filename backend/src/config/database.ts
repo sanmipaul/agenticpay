@@ -2,7 +2,7 @@
  * database.ts
  *
  * Database configuration, query profiling, connection pool tuning,
- * and recommended composite indexes for AgenticPay.
+ * PgBouncer integration, and recommended composite indexes for AgenticPay.
  */
 
 import { featureFlags } from './featureFlags.js';
@@ -54,6 +54,386 @@ export function buildPoolConfig(env = process.env.NODE_ENV): PoolConfig {
       };
   }
 }
+
+// ── PgBouncer Integration ─────────────────────────────────────────────────────
+
+export interface PgBouncerConfig {
+  enabled: boolean;
+  poolMode: 'transaction' | 'session' | 'statement';
+  defaultPoolSize: number;
+  maxPoolSize: number;
+  minPoolSize: number;
+  reservePoolSize: number;
+  reservePoolTimeoutMs: number;
+  maxClientConnections: number;
+  maxPreparedStatements: number;
+  queryTimeoutMs: number;
+  idleTimeoutMs: number;
+  serverLifetimeMs: number;
+  serverIdleTimeoutMs: number;
+  healthCheckIntervalMs: number;
+}
+
+const DEFAULT_PGBOUNCER_CONFIG: PgBouncerConfig = {
+  enabled: process.env.PGBOUNCER_ENABLED === 'true',
+  poolMode: 'transaction',
+  defaultPoolSize: envInt('PGBOUNCER_DEFAULT_POOL_SIZE', 25),
+  maxPoolSize: envInt('PGBOUNCER_MAX_POOL_SIZE', 50),
+  minPoolSize: envInt('PGBOUNCER_MIN_POOL_SIZE', 5),
+  reservePoolSize: envInt('PGBOUNCER_RESERVE_POOL_SIZE', 5),
+  reservePoolTimeoutMs: envInt('PGBOUNCER_RESERVE_POOL_TIMEOUT_MS', 5_000),
+  maxClientConnections: envInt('PGBOUNCER_MAX_CLIENT_CONNECTIONS', 100),
+  maxPreparedStatements: envInt('PGBOUNCER_MAX_PREPARED_STATEMENTS', 50),
+  queryTimeoutMs: envInt('PGBOUNCER_QUERY_TIMEOUT_MS', 30_000),
+  idleTimeoutMs: envInt('PGBOUNCER_IDLE_TIMEOUT_MS', 600_000),
+  serverLifetimeMs: envInt('PGBOUNCER_SERVER_LIFETIME_MS', 3_600_000),
+  serverIdleTimeoutMs: envInt('PGBOUNCER_SERVER_IDLE_TIMEOUT_MS', 600_000),
+  healthCheckIntervalMs: envInt('PGBOUNCER_HEALTH_CHECK_INTERVAL_MS', 30_000),
+};
+
+let pgBouncerConfig: PgBouncerConfig = { ...DEFAULT_PGBOUNCER_CONFIG };
+
+export function configurePgBouncer(config: Partial<PgBouncerConfig>): void {
+  pgBouncerConfig = { ...pgBouncerConfig, ...config };
+}
+
+export function getPgBouncerConfig(): PgBouncerConfig {
+  return { ...pgBouncerConfig };
+}
+
+// ── Pool Metrics ──────────────────────────────────────────────────────────────
+
+interface ConnectionPoolMetrics {
+  activeConnections: number;
+  idleConnections: number;
+  waitingClients: number;
+  totalConnections: number;
+  maxConnections: number;
+  minConnections: number;
+  connectionLeasesTotal: number;
+  connectionLeasesActive: number;
+  connectionLeasesReleased: number;
+  connectionLeaseErrors: number;
+  leakedConnectionsDetected: number;
+  poolExhaustionCount: number;
+  averageAcquireTimeMs: number;
+  peakActiveConnections: number;
+  timestamp: string;
+}
+
+class PoolMetricsCollector {
+  private activeConnections = 0;
+  private idleConnections = 0;
+  private waitingClients = 0;
+  private totalConnections = 0;
+  private connectionLeasesTotal = 0;
+  private connectionLeasesActive = 0;
+  private connectionLeasesReleased = 0;
+  private connectionLeaseErrors = 0;
+  private leakedConnectionsDetected = 0;
+  private poolExhaustionCount = 0;
+  private acquireTimes: number[] = [];
+  private peakActiveConnections = 0;
+  private maxConnections = 50;
+  private minConnections = 5;
+  private readonly maxAcquireTimeSamples = 100;
+
+  setPoolLimits(max: number, min: number): void {
+    this.maxConnections = max;
+    this.minConnections = min;
+  }
+
+  recordConnectionAcquired(durationMs: number): void {
+    this.activeConnections++;
+    this.totalConnections++;
+    this.connectionLeasesTotal++;
+    this.connectionLeasesActive++;
+    this.acquireTimes.push(durationMs);
+    if (this.acquireTimes.length > this.maxAcquireTimeSamples) {
+      this.acquireTimes.shift();
+    }
+    if (this.activeConnections > this.peakActiveConnections) {
+      this.peakActiveConnections = this.activeConnections;
+    }
+  }
+
+  recordConnectionReleased(): void {
+    this.activeConnections = Math.max(0, this.activeConnections - 1);
+    this.connectionLeasesActive = Math.max(0, this.connectionLeasesActive - 1);
+    this.connectionLeasesReleased++;
+  }
+
+  recordConnectionIdle(): void {
+    this.idleConnections++;
+  }
+
+  recordWaitingClient(): void {
+    this.waitingClients++;
+  }
+
+  recordPoolExhaustion(): void {
+    this.poolExhaustionCount++;
+  }
+
+  recordLeakDetected(): void {
+    this.leakedConnectionsDetected++;
+  }
+
+  recordLeaseError(): void {
+    this.connectionLeaseErrors++;
+  }
+
+  snapshot(): ConnectionPoolMetrics {
+    const averageAcquireTimeMs =
+      this.acquireTimes.length > 0
+        ? this.acquireTimes.reduce((sum, t) => sum + t, 0) / this.acquireTimes.length
+        : 0;
+
+    return {
+      activeConnections: this.activeConnections,
+      idleConnections: this.idleConnections,
+      waitingClients: this.waitingClients,
+      totalConnections: this.totalConnections,
+      maxConnections: this.maxConnections,
+      minConnections: this.minConnections,
+      connectionLeasesTotal: this.connectionLeasesTotal,
+      connectionLeasesActive: this.connectionLeasesActive,
+      connectionLeasesReleased: this.connectionLeasesReleased,
+      connectionLeaseErrors: this.connectionLeaseErrors,
+      leakedConnectionsDetected: this.leakedConnectionsDetected,
+      poolExhaustionCount: this.poolExhaustionCount,
+      averageAcquireTimeMs: Math.round(averageAcquireTimeMs * 100) / 100,
+      peakActiveConnections: this.peakActiveConnections,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  reset(): void {
+    this.activeConnections = 0;
+    this.idleConnections = 0;
+    this.waitingClients = 0;
+    this.totalConnections = 0;
+    this.connectionLeasesTotal = 0;
+    this.connectionLeasesActive = 0;
+    this.connectionLeasesReleased = 0;
+    this.connectionLeaseErrors = 0;
+    this.leakedConnectionsDetected = 0;
+    this.poolExhaustionCount = 0;
+    this.acquireTimes = [];
+    this.peakActiveConnections = 0;
+  }
+}
+
+export const poolMetrics = new PoolMetricsCollector();
+
+// ── Connection Lease Manager ───────────────────────────────────────────────────
+
+interface ConnectionLease {
+  id: string;
+  acquiredAt: number;
+  released: boolean;
+}
+
+class ConnectionLeaseManager {
+  private leases = new Map<string, ConnectionLease>();
+  private readonly leaseTimeoutMs: number;
+  private leakCheckInterval?: ReturnType<typeof setInterval>;
+
+  constructor(leaseTimeoutMs = 300_000) {
+    this.leaseTimeoutMs = leaseTimeoutMs;
+  }
+
+  startLeakDetection(): void {
+    if (this.leakCheckInterval) return;
+    this.leakCheckInterval = setInterval(() => {
+      this.detectLeaks();
+    }, 60_000);
+  }
+
+  stopLeakDetection(): void {
+    if (this.leakCheckInterval) {
+      clearInterval(this.leakCheckInterval);
+      this.leakCheckInterval = undefined;
+    }
+  }
+
+  acquire(id: string): void {
+    this.leases.set(id, { id, acquiredAt: Date.now(), released: false });
+  }
+
+  release(id: string): void {
+    const lease = this.leases.get(id);
+    if (lease) {
+      lease.released = true;
+    }
+  }
+
+  private detectLeaks(): void {
+    const now = Date.now();
+    for (const [id, lease] of this.leases.entries()) {
+      if (!lease.released && now - lease.acquiredAt > this.leaseTimeoutMs) {
+        console.warn(`[PoolLeak] Connection ${id} has been held for ${now - lease.acquiredAt}ms without release`);
+        poolMetrics.recordLeakDetected();
+        this.leases.delete(id);
+      } else if (lease.released) {
+        if (now - lease.acquiredAt > 60_000) {
+          this.leases.delete(id);
+        }
+      }
+    }
+  }
+
+  getActiveLeaseCount(): number {
+    let count = 0;
+    for (const lease of this.leases.values()) {
+      if (!lease.released) count++;
+    }
+    return count;
+  }
+}
+
+export const connectionLeaseManager = new ConnectionLeaseManager();
+connectionLeaseManager.startLeakDetection();
+
+// ── Pool Exhaustion Handler ────────────────────────────────────────────────────
+
+interface PoolExhaustionHandler {
+  onExhaustion: () => void;
+  onRecovery: () => void;
+  backoffMs: number;
+  maxBackoffMs: number;
+}
+
+class PoolExhaustionManager {
+  private handlers: PoolExhaustionHandler[] = [];
+  private isExhausted = false;
+  private backoffMs = 100;
+  private readonly maxBackoffMs = 10_000;
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
+
+  registerHandler(handler: Partial<PoolExhaustionHandler>): void {
+    this.handlers.push({
+      onExhaustion: handler.onExhaustion ?? (() => {}),
+      onRecovery: handler.onRecovery ?? (() => {}),
+      backoffMs: handler.backoffMs ?? this.backoffMs,
+      maxBackoffMs: handler.maxBackoffMs ?? this.maxBackoffMs,
+    });
+  }
+
+  notifyExhaustion(): void {
+    poolMetrics.recordPoolExhaustion();
+    this.isExhausted = true;
+    this.backoffMs = Math.min(this.backoffMs * 2, this.maxBackoffMs);
+
+    for (const handler of this.handlers) {
+      try {
+        handler.onExhaustion();
+      } catch { }
+    }
+
+    console.warn(`[PoolExhaustion] Pool exhausted, backing off for ${this.backoffMs}ms`);
+  }
+
+  notifyRecovery(): void {
+    this.isExhausted = false;
+    this.backoffMs = 100;
+
+    for (const handler of this.handlers) {
+      try {
+        handler.onRecovery();
+      } catch { }
+    }
+
+    console.log('[PoolExhaustion] Pool recovered');
+  }
+
+  scheduleRecovery(): void {
+    if (this.recoveryTimer) return;
+    this.recoveryTimer = setTimeout(() => {
+      this.notifyRecovery();
+      this.recoveryTimer = undefined;
+    }, this.backoffMs);
+  }
+
+  isPoolExhausted(): boolean {
+    return this.isExhausted;
+  }
+
+  getBackoffMs(): number {
+    return this.backoffMs;
+  }
+}
+
+export const poolExhaustionManager = new PoolExhaustionManager();
+
+// ── Prepared Statement Registry ────────────────────────────────────────────────
+
+export const PREPARED_STATEMENTS = {
+  getPaymentById: 'SELECT * FROM payments WHERE id = $1 AND tenant_id = $2 LIMIT 1',
+  listPendingPayments:
+    "SELECT id, tx_hash, amount, network FROM payments WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1",
+  upsertGasEstimate: `
+    INSERT INTO gas_estimates (network, gas_price_gwei, base_fee_gwei, recorded_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (network) DO UPDATE
+      SET gas_price_gwei = EXCLUDED.gas_price_gwei,
+          base_fee_gwei  = EXCLUDED.base_fee_gwei,
+          recorded_at    = EXCLUDED.recorded_at
+  `,
+} as const;
+
+export type PreparedStatementKey = keyof typeof PREPARED_STATEMENTS;
+
+class PreparedStatementManager {
+  private statements = new Map<string, string>();
+  private maxStatements: number;
+  private deallocateOnError = true;
+
+  constructor(maxStatements = 50) {
+    this.maxStatements = maxStatements;
+  }
+
+  register(name: string, sql: string): void {
+    if (this.statements.size >= this.maxStatements) {
+      const oldestKey = this.statements.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.statements.delete(oldestKey as string);
+      }
+    }
+    this.statements.set(name, sql);
+  }
+
+  get(name: string): string | undefined {
+    return this.statements.get(name);
+  }
+
+  registerDefaults(): void {
+    for (const [name, sql] of Object.entries(PREPARED_STATEMENTS)) {
+      this.register(name, sql);
+    }
+  }
+
+  deallocate(name: string): void {
+    this.statements.delete(name);
+  }
+
+  deallocateAll(): void {
+    this.statements.clear();
+  }
+
+  getRegisteredStatements(): Array<{ name: string; sql: string }> {
+    return Array.from(this.statements.entries()).map(([name, sql]) => ({ name, sql }));
+  }
+
+  getStatementCount(): number {
+    return this.statements.size;
+  }
+}
+
+export const preparedStatementManager = new PreparedStatementManager(
+  envInt('PGBOUNCER_MAX_PREPARED_STATEMENTS', 50),
+);
+preparedStatementManager.registerDefaults();
 
 // ── Slow query detection ───────────────────────────────────────────────────────
 
@@ -208,24 +588,6 @@ export function getRecommendedIndexes(): CompositeIndex[] {
   if (!featureFlags.evaluate('db-composite-indexes')) return [];
   return RECOMMENDED_INDEXES;
 }
-
-// ── Prepared statement registry ───────────────────────────────────────────────
-
-export const PREPARED_STATEMENTS = {
-  getPaymentById: 'SELECT * FROM payments WHERE id = $1 AND tenant_id = $2 LIMIT 1',
-  listPendingPayments:
-    "SELECT id, tx_hash, amount, network FROM payments WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1",
-  upsertGasEstimate: `
-    INSERT INTO gas_estimates (network, gas_price_gwei, base_fee_gwei, recorded_at)
-    VALUES ($1, $2, $3, NOW())
-    ON CONFLICT (network) DO UPDATE
-      SET gas_price_gwei = EXCLUDED.gas_price_gwei,
-          base_fee_gwei  = EXCLUDED.base_fee_gwei,
-          recorded_at    = EXCLUDED.recorded_at
-  `,
-} as const;
-
-export type PreparedStatementKey = keyof typeof PREPARED_STATEMENTS;
 
 // ── Read replica routing ───────────────────────────────────────────────────────
 

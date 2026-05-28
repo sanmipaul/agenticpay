@@ -1,6 +1,7 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../config/env.js';
 import { withQueryProfiling } from '../config/database.js';
+import { withCircuitBreaker, CircuitBreakerError } from '../middleware/circuit-breaker.js';
 
 const NETWORK = config().STELLAR_NETWORK;
 const HORIZON_URL =
@@ -8,7 +9,11 @@ const HORIZON_URL =
     ? 'https://horizon.stellar.org'
     : 'https://horizon-testnet.stellar.org';
 
-export const server = new StellarSdk.Horizon.Server(HORIZON_URL);
+const STELLAR_CIRCUIT_NAME = 'stellar-horizon';
+
+const serverOptions: StellarSdk.Horizon.Server.Options = {};
+
+export const server = new StellarSdk.Horizon.Server(HORIZON_URL, serverOptions);
 
 const networkPassphrase =
   NETWORK === 'public'
@@ -82,13 +87,23 @@ class NonceManager {
     }
 
     try {
-      const account = await server.loadAccount(address);
+      const account = await withCircuitBreaker(
+        STELLAR_CIRCUIT_NAME,
+        () => server.loadAccount(address),
+      );
       state.current = account.sequence;
       state.locked = true;
       state.lastUsedAt = Date.now();
       this.nonces.set(address, state);
       return state.current;
     } catch (error) {
+      if (error instanceof CircuitBreakerError) {
+        throw new UnitOfWorkError(
+          `Stellar Horizon unavailable: ${error.message}`,
+          'acquire-nonce',
+          error,
+        );
+      }
       throw new UnitOfWorkError(
         `Failed to acquire nonce for ${address}`,
         'acquire-nonce',
@@ -116,7 +131,10 @@ class NonceManager {
   async resolveConflict(address: string): Promise<string> {
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
-        const account = await server.loadAccount(address);
+        const account = await withCircuitBreaker(
+          STELLAR_CIRCUIT_NAME,
+          () => server.loadAccount(address),
+        );
         const state = this.nonces.get(address);
         if (state) {
           state.current = account.sequence;
@@ -166,12 +184,15 @@ class GasEstimator {
     const now = Date.now();
     if (now - this.estimateTimestamp > this.estimateTtlMs) {
       try {
-        const feeStats = await server.feeStats();
+        const feeStats = await withCircuitBreaker(
+          STELLAR_CIRCUIT_NAME,
+          () => server.feeStats(),
+          async () => ({ max_fee: { mode: '100' }, last_ledger: '0' }),
+        );
         this.baseFee = parseInt(feeStats.max_fee?.mode || '100', 10);
         this.lastEstimate = this.baseFee;
         this.estimateTimestamp = now;
 
-        const ledgers = parseInt(feeStats.last_ledger, 10) || 0;
         const surge = feeStats.max_fee?.mode && parseInt(feeStats.max_fee.mode, 10) > 1000;
         this.surgeMultiplier = surge ? 2.0 : 1.0;
       } catch {
@@ -370,7 +391,10 @@ export async function getAccountInfo(address: string) {
     `getAccountInfo(${address})`,
     'stellar.service',
     async () => {
-      const account = await server.loadAccount(address);
+      const account = await withCircuitBreaker(
+        STELLAR_CIRCUIT_NAME,
+        () => server.loadAccount(address),
+      );
       return {
         address: account.accountId(),
         balances: account.balances.map((b) => ({
@@ -390,7 +414,10 @@ export async function getTransactionStatus(hash: string) {
     `getTransactionStatus(${hash})`,
     'stellar.service',
     async () => {
-      const tx = await server.transactions().transaction(hash).call();
+      const tx = await withCircuitBreaker(
+        STELLAR_CIRCUIT_NAME,
+        () => server.transactions().transaction(hash).call(),
+      );
       return {
         hash: tx.hash,
         successful: tx.successful,
