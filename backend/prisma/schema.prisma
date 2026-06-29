@@ -1428,3 +1428,269 @@ enum UserOpStatus {
   completed
   failed
 }
+
+// ─── Issue #470: Atomic Swap / HTLC Models ────────────────────────────────────
+
+enum AtomicSwapStatus {
+  pending
+  claimed
+  refunded
+  disputed
+}
+
+model AtomicSwap {
+  id                String            @id @default(uuid())
+  tenantId          String            @map("tenant_id")
+  swapId            BigInt            @unique @map("swap_id")
+  sender            String
+  receiver          String
+  tokenA            String            @map("token_a")
+  tokenB            String            @map("token_b")
+  amountA           Decimal           @map("amount_a") @db.Decimal(20, 8)
+  amountB           Decimal           @map("amount_b") @db.Decimal(20, 8)
+  hashlock          String
+  timelock          BigInt            @map("timelock")
+  disputeDeadline   BigInt?           @map("dispute_deadline")
+  status            AtomicSwapStatus  @default(pending)
+  feeBps            Int               @default(30) @map("fee_bps")
+  feeCollector      String?           @map("fee_collector")
+  contractAddress   String?           @map("contract_address")
+  network           String            @default("soroban")
+  expiresAt         DateTime?         @map("expires_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+  deletedAt         DateTime?         @map("deleted_at")
+
+  secret AtomicSwapSecret?
+
+  @@index([tenantId])
+  @@index([sender])
+  @@index([receiver])
+  @@index([status])
+  @@map("atomic_swaps")
+}
+
+model AtomicSwapSecret {
+  id        String   @id @default(uuid())
+  swapId    String   @unique @map("swap_id")
+  preimage  String
+  revealedAt DateTime @default(now()) @map("revealed_at")
+
+  swap AtomicSwap @relation(fields: [swapId], references: [id], onDelete: Cascade)
+
+  @@map("atomic_swap_secrets")
+}
+
+// ─── Issue #469: Multi-Signature Treasury Models ─────────────────────────────
+
+enum TreasuryProposalStatus {
+  pending
+  approved
+  executed
+  rejected
+  cancelled
+  expired
+}
+
+model TreasuryProposal {
+  id              String                  @id @default(uuid())
+  tenantId        String                  @map("tenant_id")
+  proposalId      BigInt                  @map("proposal_id")
+  proposer        String
+  description     String
+  target          String
+  amount          Decimal                 @db.Decimal(20, 8)
+  token           String?
+  calldata        String?
+  status          TreasuryProposalStatus  @default(pending)
+  approvalCount   Int                     @default(0) @map("approval_count")
+  rejectionCount  Int                     @default(0) @map("rejection_count")
+  threshold       Int                     @default(1)
+  timelockDelay   BigInt                  @map("timelock_delay")
+  executeAfter    DateTime                @map("execute_after")
+  createdAt       DateTime                @default(now()) @map("created_at")
+  executedAt      DateTime?               @map("executed_at")
+  updatedAt       DateTime                @updatedAt @map("updated_at")
+  deletedAt       DateTime?               @map("deleted_at")
+
+  approvals TreasuryApproval[]
+  execution TreasuryExecution?
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([tenantId, status])
+  @@map("treasury_proposals")
+}
+
+model TreasuryApproval {
+  id          String   @id @default(uuid())
+  proposalId  String   @map("proposal_id")
+  signer      String
+  approved    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  proposal TreasuryProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, signer])
+  @@index([proposalId])
+  @@map("treasury_approvals")
+}
+
+model TreasuryExecution {
+  id            String   @id @default(uuid())
+  proposalId    String   @unique @map("proposal_id")
+  txHash        String?  @map("tx_hash")
+  executedBy    String   @map("executed_by")
+  executedAt    DateTime @default(now()) @map("executed_at")
+  error         String?
+  chain         String   @default("soroban")
+
+  proposal TreasuryProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+
+  @@map("treasury_executions")
+}
+
+// ─── Issue #471: API Key Usage Analytics and Quota Models ─────────────────────
+
+model ApiKey {
+  id            String    @id @default(uuid())
+  tenantId      String    @map("tenant_id")
+  keyId         String    @unique @map("key_id")
+  description   String?
+  isActive      Boolean   @default(true) @map("is_active")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  expiresAt     DateTime? @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+
+  usage ApiKeyUsage[]
+  quota ApiKeyQuota?
+
+  @@index([tenantId])
+  @@index([keyId])
+  @@map("api_keys")
+}
+
+model ApiKeyUsage {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  keyId       String   @map("key_id")
+  endpoint    String
+  method      String   @default("GET")
+  statusCode  Int      @map("status_code")
+  latencyMs   Int      @map("latency_ms")
+  payloadSize Int?     @map("payload_size")
+  ipAddress   String?  @map("ip_address")
+  recordedAt  DateTime @default(now()) @map("recorded_at")
+
+  key ApiKey @relation(fields: [keyId], references: [id], onDelete: Cascade)
+
+  @@index([keyId])
+  @@index([tenantId, recordedAt])
+  @@index([keyId, recordedAt])
+  @@index([recordedAt])
+  @@map("api_key_usage")
+}
+
+model ApiKeyQuota {
+  id              String   @id @default(uuid())
+  keyId           String   @unique @map("key_id")
+  requestsPerHour Int      @default(1000) @map("requests_per_hour")
+  requestsPerDay  Int      @default(10000) @map("requests_per_day")
+  alertAt50Pct    Boolean  @default(true) @map("alert_at_50_pct")
+  alertAt80Pct    Boolean  @default(true) @map("alert_at_80_pct")
+  alertAt100Pct   Boolean  @default(true) @map("alert_at_100_pct")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  key ApiKey @relation(fields: [keyId], references: [id], onDelete: Cascade)
+
+  @@map("api_key_quotas")
+}
+
+// ─── Issue #472: Custom Report Builder Models ────────────────────────────────
+
+enum ReportChartType {
+  line
+  bar
+  pie
+  table
+  heatmap
+  area
+}
+
+enum ReportScheduleFrequency {
+  daily
+  weekly
+  monthly
+}
+
+model SavedReport {
+  id          String            @id @default(uuid())
+  tenantId    String            @map("tenant_id")
+  userId      String?           @map("user_id")
+  name        String
+  description String?
+  metrics     String[]
+  dimensions  String[]
+  filters     Json?
+  chartType   ReportChartType   @default(line)
+  dateRange   Json?
+  isFavorite  Boolean           @default(false) @map("is_favorite")
+  isPinned    Boolean           @default(false) @map("is_pinned")
+  config      Json?
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+  deletedAt   DateTime?         @map("deleted_at")
+
+  schedule ScheduledReport?
+  template ReportTemplate?
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([isFavorite])
+  @@index([tenantId, updatedAt])
+  @@map("saved_reports")
+}
+
+model ScheduledReport {
+  id             String                   @id @default(uuid())
+  reportId       String                   @unique @map("report_id")
+  frequency      ReportScheduleFrequency
+  dayOfWeek      Int?                     @default(1) @map("day_of_week")
+  dayOfMonth     Int?                     @default(1) @map("day_of_month")
+  time           String                   @default("09:00")
+  recipients     String[]
+  lastSentAt     DateTime?                @map("last_sent_at")
+  nextSendAt     DateTime?                @map("next_send_at")
+  isActive       Boolean                  @default(true) @map("is_active")
+  createdAt      DateTime                 @default(now()) @map("created_at")
+  updatedAt      DateTime                 @updatedAt @map("updated_at")
+
+  report SavedReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([isActive])
+  @@index([nextSendAt])
+  @@map("scheduled_reports")
+}
+
+model ReportTemplate {
+  id          String          @id @default(uuid())
+  reportId    String          @unique @map("report_id")
+  name        String
+  description String?
+  metrics     String[]
+  dimensions  String[]
+  filters     Json?
+  chartType   ReportChartType @default(line)
+  dateRange   Json?
+  config      Json?
+  isPublic    Boolean         @default(false) @map("is_public")
+  usageCount  Int             @default(0) @map("usage_count")
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  report SavedReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([isPublic, usageCount])
+  @@map("report_templates")
+}

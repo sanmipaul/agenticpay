@@ -121,6 +121,11 @@ import { gasRouter } from './routes/gas.js';
 import { vaultsRouter } from './routes/vaults.js';
 import { createConnectionManager } from './websocket/connection-manager.js';
 import { getBridgeMonitorService } from './services/bridge-monitor/bridge-monitor.js';
+import { swapsRouter } from './routes/swaps.js';
+import { treasuryRouter } from './routes/treasury.js';
+import { apiKeysRouter } from './routes/api-keys.js';
+import { reportsRouter } from './routes/reports.js';
+import { apiUsageTracker, checkQuota } from './middleware/api-usage-tracker.js';
 
 // Validate environment variables at startup
 validateEnv();
@@ -380,6 +385,18 @@ app.use('/api/v1/auth/sessions', sessionsRouter);
 
 // HMAC signing key management — Issue #510
 app.use('/api/v1/developers/signing-keys', signingKeysRouter);
+
+// API key usage tracking and quota enforcement — Issue #471
+app.use('/api/v1/developers/api-keys', apiUsageTracker, apiKeysRouter);
+
+// Atomic swaps / HTLC management — Issue #470
+app.use('/api/v1/swaps', swapsRouter);
+
+// Multi-signature timelock treasury management — Issue #469
+app.use('/api/v1/treasury', treasuryRouter);
+
+// Custom report builder with saved templates — Issue #472
+app.use('/api/v1/reports', reportsRouter);
 
 // Sandbox environment for testing (with relaxed rate limits)
 const sandboxRouter = createSandboxRouter(getSandboxManager(), getMockPaymentProcessor(), getTestDataSeeder());
